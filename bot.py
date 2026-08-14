@@ -3,10 +3,12 @@
 دانلود کرده و برای کاربر مرتبط در تلگرام می‌فرستد.
 
 امکانات:
-  - پنل مدیریت (فقط برای ادمین) با دکمه‌های شیشه‌ای
+  - منوی کاملاً دکمه‌ای برای کاربر عادی (بدون نیاز به تایپ کامند)
+  - پنل مدیریت فول‌امکانات (فقط برای ادمین) با دکمه‌های شیشه‌ای:
+    آمار، لیست کاربران، حذف اتصال، وضعیت اینستاگرام، ورود مجدد،
+    پاک‌کردن سشن، توقف/شروع پول کردن، تنظیم فاصله چک، پیام همگانی
   - لاگین اینستاگرام کاملاً از داخل تلگرام: اگر کد دومرحله‌ای یا چالش
-    امنیتی لازم باشد، ربات از ادمین در چت تلگرام می‌خواهد که کد را
-    بفرستد (نیازی به ترمینال نیست)
+    امنیتی لازم باشد، ربات از ادمین در چت تلگرام می‌خواهد کد را بفرستد
 
 اجرا:
   python bot.py
@@ -17,8 +19,6 @@ import json
 import logging
 import os
 import queue
-import sys
-import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -46,8 +46,6 @@ log = logging.getLogger("insta_tg_bot")
 # تنظیمات و مسیرها
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).parent
-# روی ریلیوی، DATA_DIR را روی مسیر Volume ست کن (مثلاً /data) تا سشن و
-# لینک‌ها بعد از هر دیپلوی جدید پاک نشوند.
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -60,13 +58,16 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 IG_USERNAME = os.getenv("INSTAGRAM_USERNAME")
 IG_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "45"))
+DEFAULT_POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "45"))
 IG_PROXY = os.getenv("IG_PROXY", "").strip()
 CODE_WAIT_TIMEOUT = int(os.getenv("CODE_WAIT_TIMEOUT_SECONDS", "600"))
 
 ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip().isdigit()
 }
+
+# حالت "منتظر ورودی متنی از کاربر" -> { chat_id: "link_username" | "broadcast" | "set_interval" | "remove_user" }
+pending_input: dict[int, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -111,21 +112,18 @@ def set_seen(thread_id: str, item_id: str):
     save_json(SEEN_FILE, seen)
 
 
+def is_admin(user_id: int | None) -> bool:
+    return user_id is not None and user_id in ADMIN_IDS
+
+
 # ---------------------------------------------------------------------------
 # مکانیزم دریافت کد ورود (2FA / چالش امنیتی) از ادمین، از طریق تلگرام
 # ---------------------------------------------------------------------------
-# چون لاگین اینستاگرام در یک ترد جداگانه (asyncio.to_thread) اجرا می‌شود، برای
-# رد و بدل کردن کد بین آن ترد و لوپ اصلی تلگرام از یک صف Thread-safe استفاده
-# می‌کنیم.
 _code_queue: "queue.Queue[str]" = queue.Queue()
 _awaiting_code = {"active": False}
 
 
 def request_code_from_admin(application: Application, loop: asyncio.AbstractEventLoop, prompt: str) -> str:
-    """
-    این تابع داخل ترد جداگانه (نه ترد اصلی asyncio) صدا زده می‌شود.
-    پیام را برای ادمین می‌فرستد و تا رسیدن پاسخ او (از طریق تلگرام) بلاک می‌ماند.
-    """
     if not ADMIN_IDS:
         raise RuntimeError(
             "ADMIN_TELEGRAM_IDS تنظیم نشده؛ ربات نمی‌داند کد را از چه کسی در تلگرام بخواهد."
@@ -134,8 +132,6 @@ def request_code_from_admin(application: Application, loop: asyncio.AbstractEven
     admin_id = next(iter(ADMIN_IDS))
     _awaiting_code["active"] = True
 
-    # چون این کد در یک ترد غیرهمزمان اجرا می‌شود، ارسال پیام را با
-    # run_coroutine_threadsafe به لوپ اصلی می‌سپاریم.
     fut = asyncio.run_coroutine_threadsafe(
         application.bot.send_message(chat_id=admin_id, text=prompt),
         loop,
@@ -152,23 +148,6 @@ def request_code_from_admin(application: Application, loop: asyncio.AbstractEven
     return code.strip()
 
 
-async def handle_possible_code_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پیام‌های متنی ادمین را می‌گیرد؛ اگر منتظر کد ورود بودیم، آن را به صف می‌فرستد."""
-    user = update.effective_user
-    if not user or user.id not in ADMIN_IDS:
-        return
-    if not _awaiting_code["active"]:
-        return
-
-    code = (update.message.text or "").strip()
-    if not code:
-        return
-
-    _awaiting_code["active"] = False
-    _code_queue.put(code)
-    await update.message.reply_text("کد دریافت شد ✅ در حال تلاش برای ورود به اینستاگرام...")
-
-
 # ---------------------------------------------------------------------------
 # اتصال به اینستاگرام
 # ---------------------------------------------------------------------------
@@ -177,8 +156,6 @@ def ig_login(application: Application, loop: asyncio.AbstractEventLoop) -> IGCli
     if IG_PROXY:
         cl.set_proxy(IG_PROXY)
 
-    # هندلر سفارشی: هر وقت اینستاگرام برای چالش امنیتی کد بخواهد (پیامک/ایمیل)،
-    # این تابع صدا زده می‌شود و باید کد را برگرداند.
     def challenge_code_handler(username, choice):
         choice_name = getattr(choice, "name", str(choice))
         prompt = (
@@ -194,7 +171,7 @@ def ig_login(application: Application, loop: asyncio.AbstractEventLoop) -> IGCli
         try:
             cl.load_settings(SESSION_FILE)
             cl.login(IG_USERNAME, IG_PASSWORD)
-            cl.get_timeline_feed()  # تست معتبر بودن سشن
+            cl.get_timeline_feed()
             log.info("با سشن ذخیره‌شده وارد اینستاگرام شدیم.")
             return cl
         except Exception as e:
@@ -210,12 +187,22 @@ def ig_login(application: Application, loop: asyncio.AbstractEventLoop) -> IGCli
         code = request_code_from_admin(application, loop, prompt)
         cl.login(IG_USERNAME, IG_PASSWORD, verification_code=code)
     except ChallengeRequired:
-        # تلاش برای حل خودکار چالش با استفاده از challenge_code_handler که بالاتر ست شد
         cl.challenge_resolve(cl.last_json)
 
     cl.dump_settings(SESSION_FILE)
     log.info("لاگین موفق به اینستاگرام و ذخیره سشن.")
     return cl
+
+
+PROXY_HINT = (
+    "این خطا معمولاً یعنی IP سرور (مثلاً ریلیوی) توسط اینستاگرام مشکوک/مسدود "
+    "شناخته شده، چون یک IP دیتاسنتریه نه موبایل/خانگی.\n\n"
+    "راه‌حل‌های پیشنهادی:\n"
+    "۱) یک پروکسی مسکونی (Residential Proxy) تهیه کن و مقدارش رو در متغیر محیطی "
+    "IG_PROXY بذار (فرمت: http://user:pass@host:port) و از پنل، «ورود مجدد» رو بزن.\n"
+    "۲) چند ساعت صبر کن، ممکنه محدودیت موقت باشه.\n"
+    "۳) مطمئن شو یوزرنیم/پسورد درسته و با اپ موبایل چک کن اکانت قفل/چالش‌خورده نباشه."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -236,13 +223,13 @@ def download_shared_media(cl: IGClient, item) -> list[Path]:
         return paths
 
     try:
-        if info.media_type == 1:  # عکس
+        if info.media_type == 1:
             path = cl.photo_download(info.pk, folder=DOWNLOAD_DIR)
             paths.append(Path(path))
-        elif info.media_type == 2:  # ویدیو / ریل
+        elif info.media_type == 2:
             path = cl.video_download(info.pk, folder=DOWNLOAD_DIR)
             paths.append(Path(path))
-        elif info.media_type == 8:  # کاروسل
+        elif info.media_type == 8:
             downloaded = cl.album_download(info.pk, folder=DOWNLOAD_DIR)
             paths.extend(Path(p) for p in downloaded)
     except Exception as e:
@@ -329,59 +316,113 @@ async def poll_instagram(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# دستورات عمومی تلگرام
+# کنترل جاب پول کردن (شروع/توقف/تغییر فاصله)
 # ---------------------------------------------------------------------------
+def start_polling_job(application: Application, interval: int):
+    old_job = application.bot_data.get("poll_job")
+    if old_job:
+        old_job.schedule_removal()
+    job = application.job_queue.run_repeating(
+        poll_instagram, interval=interval, first=5, name="poll_instagram"
+    )
+    application.bot_data["poll_job"] = job
+    application.bot_data["poll_interval"] = interval
+    log.info("پول کردن دایرکت اینستاگرام هر %s ثانیه فعال شد.", interval)
+
+
+def stop_polling_job(application: Application):
+    job = application.bot_data.get("poll_job")
+    if job:
+        job.schedule_removal()
+    application.bot_data["poll_job"] = None
+
+
+# ---------------------------------------------------------------------------
+# منوی کاربر عادی (کاملاً دکمه‌ای)
+# ---------------------------------------------------------------------------
+def user_menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    links = get_links()
+    is_linked = chat_id in links.values()
+    rows = []
+    if is_linked:
+        rows.append([InlineKeyboardButton("🔄 تغییر اکانت متصل", callback_data="user:link")])
+        rows.append([InlineKeyboardButton("❌ قطع اتصال", callback_data="user:unlink")])
+    else:
+        rows.append([InlineKeyboardButton("🔗 اتصال اکانت اینستاگرام", callback_data="user:link")])
+    rows.append([InlineKeyboardButton("ℹ️ راهنما", callback_data="user:help")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     await update.message.reply_text(
         "سلام! 👋\n"
-        "برای دریافت خودکار پست/ریل‌هایی که به اکانت اینستاگرام مخصوص این ربات "
-        "توی دایرکت می‌فرستی، اول باید اکانتت رو معرفی کنی:\n\n"
-        "/link یوزرنیم_اینستاگرامت\n\n"
-        "بعدش هر پست یا ریلی که از طریق دکمه Share برای اکانت اینستاگرام ربات "
-        "بفرستی، خودکار برات اینجا میاد."
+        "با این ربات می‌تونی پست/ریل‌هایی که تو اینستاگرام برای اکانت مخصوص "
+        "این ربات دایرکت می‌کنی رو خودکار همینجا دریافت کنی.\n\n"
+        "از دکمه‌های زیر استفاده کن:",
+        reply_markup=user_menu_keyboard(chat_id),
     )
 
 
-async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("استفاده درست: /link یوزرنیم_اینستاگرامت (بدون @)")
-        return
+async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat.id
+    action = query.data.split(":", 1)[1]
+    await query.answer()
 
-    ig_username = context.args[0].lstrip("@").strip()
-    set_link(ig_username, update.effective_chat.id)
-    await update.message.reply_text(
-        f"ثبت شد ✅\nاکانت اینستاگرام @{ig_username} به این چت وصل شد.\n"
-        "حالا هر چی از دایرکت اون اکانت به اکانت ربات بفرستی، اینجا برات میاد."
-    )
+    if action == "link":
+        pending_input[chat_id] = "link_username"
+        cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="user:cancel")]])
+        await query.edit_message_text(
+            "لطفاً یوزرنیم اینستاگرامت رو (بدون @) به‌صورت یک پیام معمولی بفرست:",
+            reply_markup=cancel_kb,
+        )
 
+    elif action == "unlink":
+        links = get_links()
+        removed = [u for u, c in links.items() if c == chat_id]
+        for u in removed:
+            remove_link(u)
+        text = "اتصال با موفقیت قطع شد ✅" if removed else "اکانتی برای این چت متصل نبود."
+        await query.edit_message_text(text, reply_markup=user_menu_keyboard(chat_id))
 
-async def cmd_unlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    links = get_links()
-    chat_id = update.effective_chat.id
-    removed = [u for u, c in list(links.items()) if c == chat_id]
-    for u in removed:
-        del links[u]
-    save_json(LINKS_FILE, links)
-    if removed:
-        await update.message.reply_text("اتصال حذف شد.")
-    else:
-        await update.message.reply_text("اکانتی برای این چت ثبت نشده بود.")
+    elif action == "help":
+        await query.edit_message_text(
+            "ℹ️ راهنمای استفاده:\n\n"
+            "۱) دکمه‌ی «اتصال اکانت اینستاگرام» رو بزن و یوزرنیمت رو بفرست.\n"
+            "۲) از همون اکانت، پست یا ریل موردنظر رو با دکمه‌ی Share برای اکانت "
+            "اینستاگرام ربات بفرست.\n"
+            "۳) ظرف چند ثانیه فایل خودکار همینجا برات میاد.",
+            reply_markup=user_menu_keyboard(chat_id),
+        )
+
+    elif action == "cancel":
+        pending_input.pop(chat_id, None)
+        await query.edit_message_text("لغو شد.", reply_markup=user_menu_keyboard(chat_id))
+
+    elif action == "menu":
+        await query.edit_message_text("منو:", reply_markup=user_menu_keyboard(chat_id))
 
 
 # ---------------------------------------------------------------------------
-# پنل مدیریت (فقط ادمین)
+# پنل مدیریت فول‌امکانات (فقط ادمین)
 # ---------------------------------------------------------------------------
-def is_admin(user_id: int | None) -> bool:
-    return user_id is not None and user_id in ADMIN_IDS
+def admin_panel_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    polling_on = context.bot_data.get("poll_job") is not None
+    interval = context.bot_data.get("poll_interval", DEFAULT_POLL_INTERVAL)
+    toggle_label = "⏸ توقف پول کردن دایرکت" if polling_on else "▶️ شروع پول کردن دایرکت"
 
-
-def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📊 آمار ربات", callback_data="admin:stats")],
-            [InlineKeyboardButton("👥 اکانت‌های متصل", callback_data="admin:links")],
+            [InlineKeyboardButton("👥 لیست اکانت‌های متصل", callback_data="admin:users")],
+            [InlineKeyboardButton("🗑 حذف یک اتصال", callback_data="admin:remove_user")],
             [InlineKeyboardButton("🔌 وضعیت اتصال اینستاگرام", callback_data="admin:ig_status")],
             [InlineKeyboardButton("🔁 ورود مجدد به اینستاگرام", callback_data="admin:ig_relogin")],
+            [InlineKeyboardButton("🧹 پاک‌کردن سشن اینستاگرام", callback_data="admin:clear_session")],
+            [InlineKeyboardButton(toggle_label, callback_data="admin:toggle_polling")],
+            [InlineKeyboardButton(f"⏱ فاصله چک دایرکت (الان {interval}s)", callback_data="admin:set_interval")],
+            [InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data="admin:broadcast")],
         ]
     )
 
@@ -394,13 +435,14 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🛠 پنل مدیریت ربات\n\nیکی از گزینه‌ها رو انتخاب کن:",
-        reply_markup=admin_panel_keyboard(),
+        reply_markup=admin_panel_keyboard(context),
     )
 
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
+    chat_id = query.message.chat.id
 
     if not is_admin(user.id if user else None):
         await query.answer("⛔️ دسترسی نداری.", show_alert=True)
@@ -408,26 +450,37 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
     action = query.data.split(":", 1)[1]
+    cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="admin:cancel")]])
 
     if action == "stats":
         links = get_links()
         ig_connected = context.bot_data.get("ig_client") is not None
+        polling_on = context.bot_data.get("poll_job") is not None
+        interval = context.bot_data.get("poll_interval", DEFAULT_POLL_INTERVAL)
         text = (
             "📊 آمار ربات\n\n"
             f"تعداد اکانت‌های متصل: {len(links)}\n"
             f"وضعیت اینستاگرام: {'متصل ✅' if ig_connected else 'قطع ❌'}\n"
-            f"فاصله‌ی چک دایرکت: هر {POLL_INTERVAL_SECONDS} ثانیه"
+            f"پول کردن دایرکت: {'فعال ✅' if polling_on else 'متوقف ⏸'}\n"
+            f"فاصله‌ی چک: هر {interval} ثانیه"
         )
-        await query.edit_message_text(text, reply_markup=admin_panel_keyboard())
+        await query.edit_message_text(text, reply_markup=admin_panel_keyboard(context))
 
-    elif action == "links":
+    elif action == "users":
         links = get_links()
         if not links:
             text = "👥 هیچ اکانتی هنوز متصل نشده."
         else:
             lines = [f"• @{u} → chat_id: {c}" for u, c in links.items()]
             text = "👥 اکانت‌های متصل:\n\n" + "\n".join(lines)
-        await query.edit_message_text(text, reply_markup=admin_panel_keyboard())
+        await query.edit_message_text(text, reply_markup=admin_panel_keyboard(context))
+
+    elif action == "remove_user":
+        pending_input[chat_id] = "remove_user"
+        await query.edit_message_text(
+            "یوزرنیم اینستاگرامی که می‌خوای اتصالش حذف بشه رو (بدون @) بفرست:",
+            reply_markup=cancel_kb,
+        )
 
     elif action == "ig_status":
         cl = context.bot_data.get("ig_client")
@@ -439,7 +492,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = f"🔌 وضعیت اینستاگرام: متصل ✅\nاکانت: @{username}"
             except Exception:
                 text = "🔌 وضعیت اینستاگرام: متصل ✅ (جزئیات در دسترس نیست)"
-        await query.edit_message_text(text, reply_markup=admin_panel_keyboard())
+        await query.edit_message_text(text, reply_markup=admin_panel_keyboard(context))
 
     elif action == "ig_relogin":
         await query.edit_message_text("⏳ در حال تلاش برای ورود مجدد به اینستاگرام...")
@@ -447,10 +500,123 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             new_cl = await asyncio.to_thread(ig_login, context.application, loop)
             context.bot_data["ig_client"] = new_cl
-            await context.bot.send_message(user.id, "✅ ورود مجدد به اینستاگرام موفق بود.")
+            await context.bot.send_message(chat_id, "✅ ورود مجدد به اینستاگرام موفق بود.")
         except Exception as e:
             log.error("ورود مجدد شکست خورد: %s", e)
-            await context.bot.send_message(user.id, f"❌ ورود ناموفق بود:\n{e}")
+            await context.bot.send_message(chat_id, f"❌ ورود ناموفق بود:\n{e}\n\n{PROXY_HINT}")
+        await context.bot.send_message(chat_id, "منو:", reply_markup=admin_panel_keyboard(context))
+
+    elif action == "clear_session":
+        try:
+            SESSION_FILE.unlink(missing_ok=True)
+            context.bot_data["ig_client"] = None
+            text = "🧹 سشن پاک شد ✅ برای لاگین مجدد از «ورود مجدد به اینستاگرام» استفاده کن."
+        except Exception as e:
+            text = f"خطا در پاک‌کردن سشن: {e}"
+        await query.edit_message_text(text, reply_markup=admin_panel_keyboard(context))
+
+    elif action == "toggle_polling":
+        if context.bot_data.get("poll_job") is not None:
+            stop_polling_job(context.application)
+            text = "⏸ پول کردن دایرکت متوقف شد."
+        else:
+            start_polling_job(context.application, context.bot_data.get("poll_interval", DEFAULT_POLL_INTERVAL))
+            text = "▶️ پول کردن دایرکت دوباره شروع شد."
+        await query.edit_message_text(text, reply_markup=admin_panel_keyboard(context))
+
+    elif action == "set_interval":
+        pending_input[chat_id] = "set_interval"
+        await query.edit_message_text(
+            "فاصله‌ی جدید چک دایرکت رو به ثانیه بفرست (حداقل ۱۰):",
+            reply_markup=cancel_kb,
+        )
+
+    elif action == "broadcast":
+        pending_input[chat_id] = "broadcast"
+        await query.edit_message_text(
+            "متنی که می‌خوای برای همه‌ی کاربرای متصل ارسال بشه رو بنویس:",
+            reply_markup=cancel_kb,
+        )
+
+    elif action == "cancel":
+        pending_input.pop(chat_id, None)
+        await query.edit_message_text("لغو شد.", reply_markup=admin_panel_keyboard(context))
+
+
+# ---------------------------------------------------------------------------
+# مدیریت پیام‌های متنی (کد ورود اینستاگرام + حالت‌های pending_input)
+# ---------------------------------------------------------------------------
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+
+    # اولویت ۱: کد ورود اینستاگرام (فقط از ادمین اول)
+    if user and is_admin(user.id) and _awaiting_code["active"]:
+        _awaiting_code["active"] = False
+        _code_queue.put(text)
+        await update.message.reply_text("کد دریافت شد ✅ در حال تلاش برای ورود به اینستاگرام...")
+        return
+
+    pending = pending_input.pop(chat_id, None)
+
+    if pending == "link_username":
+        ig_username = text.lstrip("@").strip()
+        if not ig_username:
+            pending_input[chat_id] = "link_username"
+            await update.message.reply_text("یوزرنیم نامعتبره. دوباره امتحان کن (بدون @):")
+            return
+        set_link(ig_username, chat_id)
+        await update.message.reply_text(
+            f"اکانت @{ig_username} با موفقیت وصل شد ✅\n"
+            "حالا هر پست/ریلی که از دایرکت اون اکانت به اکانت ربات بفرستی، اینجا برات میاد.",
+            reply_markup=user_menu_keyboard(chat_id),
+        )
+        return
+
+    if pending == "broadcast" and is_admin(user.id if user else None):
+        links = get_links()
+        sent = 0
+        for _, cid in links.items():
+            try:
+                await context.bot.send_message(cid, f"📢 پیام از ادمین:\n\n{text}")
+                sent += 1
+            except Exception:
+                pass
+        await update.message.reply_text(
+            f"پیام برای {sent} کاربر ارسال شد.", reply_markup=admin_panel_keyboard(context)
+        )
+        return
+
+    if pending == "set_interval" and is_admin(user.id if user else None):
+        if not text.isdigit() or int(text) < 10:
+            pending_input[chat_id] = "set_interval"
+            await update.message.reply_text("عدد معتبر (حداقل ۱۰ ثانیه) بفرست:")
+            return
+        new_interval = int(text)
+        start_polling_job(context.application, new_interval)
+        await update.message.reply_text(
+            f"فاصله‌ی چک دایرکت روی {new_interval} ثانیه تنظیم شد ✅",
+            reply_markup=admin_panel_keyboard(context),
+        )
+        return
+
+    if pending == "remove_user" and is_admin(user.id if user else None):
+        uname = text.lstrip("@").strip().lower()
+        links = get_links()
+        if uname in links:
+            remove_link(uname)
+            await update.message.reply_text(
+                f"اتصال @{uname} حذف شد ✅", reply_markup=admin_panel_keyboard(context)
+            )
+        else:
+            await update.message.reply_text(
+                "همچین اکانتی توی لیست پیدا نشد.", reply_markup=admin_panel_keyboard(context)
+            )
+        return
+
+    # هیچ حالت خاصی فعال نبود -> منو رو نشون بده
+    await update.message.reply_text("از دکمه‌های زیر استفاده کن:", reply_markup=user_menu_keyboard(chat_id))
 
 
 # ---------------------------------------------------------------------------
@@ -462,23 +628,22 @@ async def post_init(application: Application):
         application.bot_data["ig_client"] = await asyncio.to_thread(ig_login, application, loop)
     except Exception as e:
         log.error("لاگین اولیه‌ی اینستاگرام شکست خورد: %s", e)
+        application.bot_data["ig_client"] = None
         if ADMIN_IDS:
             admin_id = next(iter(ADMIN_IDS))
             await application.bot.send_message(
                 admin_id,
-                f"⚠️ لاگین اولیه به اینستاگرام شکست خورد:\n{e}\n\n"
-                "از پنل مدیریت (/admin) گزینه‌ی «ورود مجدد» رو بزن.",
+                f"⚠️ لاگین اولیه به اینستاگرام شکست خورد.\n\nپیام خطا:\n{e}\n\n{PROXY_HINT}",
             )
 
-    application.job_queue.run_repeating(poll_instagram, interval=POLL_INTERVAL_SECONDS, first=5)
-    log.info("پول کردن دایرکت اینستاگرام هر %s ثانیه فعال شد.", POLL_INTERVAL_SECONDS)
+    start_polling_job(application, DEFAULT_POLL_INTERVAL)
 
 
 def main():
     if not TELEGRAM_TOKEN or not IG_USERNAME or not IG_PASSWORD:
         raise SystemExit(
-            "لطفاً فایل .env را بر اساس .env.example پر کنید "
-            "(TELEGRAM_BOT_TOKEN, INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)."
+            "متغیرهای محیطی پر نشدن. توی تنظیمات Railway (تب Variables) این‌ها رو اضافه کن: "
+            "TELEGRAM_BOT_TOKEN, INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD."
         )
     if not ADMIN_IDS:
         log.warning(
@@ -489,12 +654,11 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("link", cmd_link))
-    app.add_handler(CommandHandler("unlink", cmd_unlink))
     app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CallbackQueryHandler(user_callback, pattern=r"^user:"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
-    # این هندلر باید آخر از همه ثبت بشه: فقط وقتی فعاله که منتظر کد ورود هستیم
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_possible_code_reply))
+    # این هندلر باید آخر از همه ثبت بشه: هم کد ورود رو می‌گیره، هم حالت‌های pending_input رو
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     log.info("ربات تلگرام استارت شد.")
     app.run_polling()
