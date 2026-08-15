@@ -1,6 +1,7 @@
 FROM python:3.11-slim
 
 # نصب xray-core برای تبدیل کانفیگ VLESS به یک پروکسی HTTP محلی
+# curl نگه داشته می‌شود چون entrypoint.sh برای تست سلامت پروکسی ازش استفاده می‌کنه
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl unzip ca-certificates && \
     curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip && \
@@ -8,7 +9,7 @@ RUN apt-get update && \
     unzip -o /tmp/xray.zip -d /usr/local/bin/xray-core && \
     ln -s /usr/local/bin/xray-core/xray /usr/local/bin/xray && \
     rm /tmp/xray.zip && \
-    apt-get purge -y unzip curl && \
+    apt-get purge -y unzip && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
