@@ -1,0 +1,11 @@
+.env
+ig_session.json
+links.json
+seen_messages.json
+proxy_vless_url.txt
+direct_proxy_url.txt
+xray_runtime_config.json
+downloads/
+__pycache__/
+*.pyc
+.venv/
