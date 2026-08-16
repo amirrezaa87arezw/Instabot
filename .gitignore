@@ -1,8 +1,0 @@
-.env
-ig_session.json
-links.json
-seen_messages.json
-downloads/
-__pycache__/
-*.pyc
-.venv/
